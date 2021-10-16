@@ -5,6 +5,7 @@
  * 
  * Remix of single joystick example at: https://github.com/MHeironimus/ArduinoJoystickLibrary
  * and: https://github.com/voroshkov/Leonardo-USB-RC-Adapter/blob/master/Leonardo-USB-RC-Adapter.ino
+ * based off: https://github.com/timonorawski/RCPPMJoystick 
  * 
  * Requires installation of single joystick library from: https://github.com/MHeironimus/ArduinoJoystickLibrary
  * 
@@ -18,6 +19,8 @@
  * 
  * Copyright (c) 2016, Timon Orawski
  * 
+ * modified by https://github.com/MrRadiotron 2020-10-16
+ *
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License
   as published by the Free Software Foundation; either version 2
@@ -33,30 +36,30 @@
   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
-#include "Joystick.h"
-
+#include <Joystick.h>
+#include <limits.h>
 #include <avr/interrupt.h>
 
 // Use for Futaba transmitters (they have shifted center value and narrower range by default)
-//#define FUTABA
+// #define FUTABA
 
 // if you have a stick that isn't centred at 1500ppm, set your center below
 #define CUSTOM_STICK_CENTER 1500
 
 // if any of your controls are inverted, comment/uncomment the lines below
-#define INVERT_THROTTLE
-#define INVERT_PITCH
-//#define INVERT_ROLL
-//#define INVERT_YAW
+bool INVERT_THROTTLE = true;
+bool INVERT_PITCH = true;
+bool INVERT_ROLL = true;
+bool INVERT_YAW = true;
 
 // Use to enable output of PPM values to serial
 //#define SERIALOUT
 
-#define RC_CHANNELS_COUNT 6
+#define RC_CHANNELS_COUNT 7
 
 #ifdef FUTABA
-#define STICK_HALFWAY 450
-#define STICK_CENTER 1530
+#define STICK_HALFWAY 370
+#define STICK_CENTER 1500
 #define THRESHOLD 200
 #else
 #ifdef CUSTOM_STICK_CENTER
@@ -69,13 +72,15 @@
 #endif
 
 #define USB_STICK_VALUE_MIN 0
-#define USB_STICK_VALUE_MAX 1000
+#define USB_STICK_VALUE_MAX 1023
 
 #define USB_STICK_ROTATION_VALUE_MIN 0
-#define USB_STICK_ROTATION_VALUE_MAX 1000
+#define USB_STICK_ROTATION_VALUE_MAX 1023
 
-#define MIN_PULSE_WIDTH (STICK_CENTER - STICK_HALFWAY - 15)
-#define MAX_PULSE_WIDTH (STICK_CENTER + STICK_HALFWAY + 15)
+#define STICK_END_DEAD_ZONE 15
+
+#define MIN_PULSE_WIDTH (STICK_CENTER - STICK_HALFWAY - STICK_END_DEAD_ZONE)
+#define MAX_PULSE_WIDTH (STICK_CENTER + STICK_HALFWAY + STICK_END_DEAD_ZONE)
 
 #define NEWFRAME_PULSE_WIDTH 3000
 
@@ -87,39 +92,115 @@
 //  divided by 2 to get the number of microseconds
 #define TIMER_COUNT_DIVIDER 2
 
+typedef struct ch_values_s {
+  int min_val;
+  int max_val;
+  int val;
+  int invert;
+  int usb_val;
+} ch_values_t;
+
+ch_values_t ch_values[RC_CHANNELS_COUNT];
+
 // this array contains the lengths of read PPM pulses in microseconds
-volatile uint16_t rcValue[RC_CHANNELS_COUNT];
+volatile uint16_t rcValue_v[RC_CHANNELS_COUNT] = {STICK_CENTER, STICK_CENTER, STICK_CENTER, STICK_CENTER, STICK_CENTER, STICK_CENTER, STICK_CENTER};
+uint16_t rcValue[RC_CHANNELS_COUNT] = {STICK_CENTER, STICK_CENTER, STICK_CENTER, STICK_CENTER, STICK_CENTER, STICK_CENTER, STICK_CENTER};
 
 // enum defines the order of channels
 enum {
-  ROLL,
-  PITCH,
-  THROTTLE,
-  YAW,
-  AUX1,
-  AUX2
+  YAW=0,
+  PITCH=1,
+  THROTTLE=2,
+  ROLL=3,
+  GEAR=4,
+  AUX1=5,
+  AUX2=6
 };
+
+// Create Joystick
+Joystick_ Joystick(JOYSTICK_DEFAULT_REPORT_ID, 
+  JOYSTICK_TYPE_JOYSTICK, 1, 0,
+  true, true, true, true, true, true,
+  false, false, false, false, false);
 
 void setup() {
   setupPins();
   initTimer();
   // Initialize Joystick Library
-  Joystick.begin(true);
+  Joystick.setXAxisRange(USB_STICK_VALUE_MIN, USB_STICK_VALUE_MAX);
+  Joystick.setYAxisRange(USB_STICK_VALUE_MIN, USB_STICK_VALUE_MAX);
+  Joystick.setZAxisRange(USB_STICK_VALUE_MIN, USB_STICK_VALUE_MAX);
+  Joystick.setRxAxisRange(USB_STICK_VALUE_MIN, USB_STICK_VALUE_MAX);
+  Joystick.setRyAxisRange(USB_STICK_VALUE_MIN, USB_STICK_VALUE_MAX);
+  Joystick.setRzAxisRange(USB_STICK_VALUE_MIN, USB_STICK_VALUE_MAX);
+//  Joystick.setThrottleRange(USB_STICK_VALUE_MIN, USB_STICK_VALUE_MAX);
+//  Joystick.setRudderRange(USB_STICK_VALUE_MIN, USB_STICK_VALUE_MAX);
+  Joystick.begin(false);
   
 #ifdef SERIALOUT
-  Serial.begin(115000);
+  Serial.begin(115200);
 #endif
+
+// set inverted axis
+  ch_values[ROLL].invert = INVERT_ROLL;
+  ch_values[THROTTLE].invert = INVERT_THROTTLE;
+  ch_values[PITCH].invert = INVERT_PITCH;
+  ch_values[YAW].invert = INVERT_YAW;
+// init min max values
+  for (int i = 0; i < RC_CHANNELS_COUNT; ++i) {
+    ch_values[i].val = STICK_CENTER;
+    ch_values[i].min_val = INT_MAX;
+    ch_values[i].max_val = INT_MIN;
+    ch_values[i].usb_val = USB_STICK_VALUE_MAX / 2;
+  }
 }
 
-// Constant that maps the phyical pin to the joystick button.
-const int pinToButtonMap = 9;
+void map_values(void) {
+  int val, max_val, min_val, invert, usb_val;
+  
+  for (int i = 0; i < RC_CHANNELS_COUNT; ++i) {
+    if (ch_values[i].val > ch_values[i].max_val) {
+      ch_values[i].max_val = ch_values[i].val;
+    }
+    if (ch_values[i].val < ch_values[i].min_val) {
+      ch_values[i].min_val = ch_values[i].val;
+    }
 
-// Last state of the button
-int lastButtonState[4] = {0,0,0,0};
+    val = ch_values[i].val;
+    max_val = ch_values[i].max_val - STICK_END_DEAD_ZONE;
+    min_val = ch_values[i].min_val + STICK_END_DEAD_ZONE;
+    invert = ch_values[i].invert;
+    usb_val = ch_values[i].usb_val;
+  
+    usb_val = map(val,
+                 min_val, max_val,
+                 USB_STICK_VALUE_MIN, USB_STICK_VALUE_MAX
+                );
+                
+    if (usb_val > USB_STICK_VALUE_MAX) {
+      usb_val = USB_STICK_VALUE_MAX;
+    }
+    if (usb_val < USB_STICK_VALUE_MIN) {
+      usb_val = USB_STICK_VALUE_MIN;
+    }
+
+    if (ch_values[i].invert) {
+      usb_val = USB_STICK_VALUE_MAX - usb_val;
+    }
+
+    ch_values[i].usb_val = usb_val;
+  }
+}
 
 void loop() {
+  for (int i = 0; i < RC_CHANNELS_COUNT; ++i) {
+    rcValue[i] = rcValue_v[i];
+    ch_values[i].val = rcValue[i];
+  }
+  map_values();
   setControllerDataJoystick();
 #ifdef SERIALOUT  
+
   Serial.print(rcValue[YAW]); 
   Serial.print("\t");
   Serial.print(rcValue[THROTTLE]); 
@@ -131,54 +212,46 @@ void loop() {
   Serial.print(rcValue[AUX1]); 
   Serial.print("\t");
   Serial.print(rcValue[AUX2]); 
+  Serial.print("\t");
+  Serial.print(rcValue[GEAR]); 
   Serial.println("\t");
 
-  Serial.print(stickValue(rcValue[YAW])); 
+  Serial.print(ch_values[YAW].usb_val); 
   Serial.print("\t");
-  Serial.print(stickValue(rcValue[THROTTLE])); 
+  Serial.print(ch_values[THROTTLE].usb_val); 
   Serial.print("\t");
-  Serial.print(stickRotationValue(rcValue[ROLL])); 
+  Serial.print(ch_values[ROLL].usb_val); 
   Serial.print("\t");
-  Serial.print(stickRotationValue(rcValue[PITCH])); 
+  Serial.print(ch_values[PITCH].usb_val); 
   Serial.print("\t");
-  Serial.print(rcValue[AUX1]); 
+  Serial.print(ch_values[AUX1].usb_val); 
   Serial.print("\t");
-  Serial.print(rcValue[AUX2]); 
+  Serial.print(ch_values[AUX2].usb_val);
+  Serial.print("\t");
+  Serial.print(ch_values[GEAR].usb_val); 
   Serial.println("\t");
 #endif
-  //Joystick.sendState();
+  Joystick.sendState();
   delay(5);
 }
 
 void setControllerDataJoystick() {
-  Joystick.setXAxis(
-    #ifdef INVERT_YAW
-      -1*
-    #endif
-    stickValue(rcValue[YAW]));
-  Joystick.setYAxis(
-    #ifdef INVERT_THROTTLE
-     1000 -
-    #endif
-    stickValue(rcValue[THROTTLE]));
-  Joystick.setXAxisRotation(
-    #ifdef INVERT_ROLL
-      1000 -
-    #endif
-    stickRotationValue(rcValue[ROLL]));
-  Joystick.setYAxisRotation(
-    #ifdef INVERT_PITCH
-      1000 -
-    #endif
-    stickRotationValue(rcValue[PITCH]));
-  Joystick.setButton(0, rcValue[AUX1] > STICK_CENTER);
-  Joystick.setButton(1, rcValue[AUX2] > STICK_CENTER);
+  Joystick.setXAxis(ch_values[ROLL].usb_val);
+  Joystick.setYAxis(ch_values[PITCH].usb_val);
+  Joystick.setRxAxis(ch_values[YAW].usb_val);
+  Joystick.setRyAxis(ch_values[THROTTLE].usb_val);
+
+  Joystick.setZAxis(ch_values[AUX1].usb_val);
+  Joystick.setRzAxis(ch_values[AUX2].usb_val);
+    
+  Joystick.setButton(0, rcValue[GEAR] > STICK_CENTER);
+  
 }
 
 void setupPins(void) {
   // Set up the Input Capture pin
   pinMode(PPM_CAPTURE_PIN, INPUT);
-  digitalWrite(PPM_CAPTURE_PIN, 1); // enable the pullup
+  //digitalWrite(PPM_CAPTURE_PIN, 1); // enable the pullup
   pinMode(LED_PIN, OUTPUT);
 }
 
@@ -188,33 +261,13 @@ void initTimer(void) {
   // ICES1: =1 for trigger on rising edge
   // CS11: =1 set prescaler to 1/8 system clock (F_CPU)
   TCCR1A = 0;
-  TCCR1B = (0 << ICNC1) | (1 << ICES1) | (1 << CS11);
+  TCCR1B = (1 << ICNC1) | (1 << ICES1) | (1 << CS11);
   TCCR1C = 0;
 
   // Interrupt setup
   // ICIE1: Input capture
   TIFR1 = (1 << ICF1); // clear pending
   TIMSK1 = (1 << ICIE1); // and enable
-}
-
-// Convert a value in the range of [Min Pulse - Max Pulse] to [0 - USB_STICK_VALUE_MAX]
-int stickValue(uint16_t rcVal) {
-  return (int)constrain(
-           map(rcVal - MIN_PULSE_WIDTH,
-               0, MAX_PULSE_WIDTH - MIN_PULSE_WIDTH,
-               USB_STICK_VALUE_MIN, USB_STICK_VALUE_MAX
-              ),
-           USB_STICK_VALUE_MIN, USB_STICK_VALUE_MAX
-         );
-}
-int stickRotationValue(uint16_t rcVal) {
-  return (int)constrain(
-           map(rcVal - MIN_PULSE_WIDTH,
-               0, MAX_PULSE_WIDTH - MIN_PULSE_WIDTH,
-               USB_STICK_ROTATION_VALUE_MIN, USB_STICK_ROTATION_VALUE_MAX
-              ),
-           USB_STICK_ROTATION_VALUE_MIN, USB_STICK_ROTATION_VALUE_MAX
-         );
 }
 
 uint16_t adjust(uint16_t diff, uint8_t chan) {
@@ -257,7 +310,7 @@ ISR(TIMER1_CAPT_vect) {
         && diff < (MAX_PULSE_WIDTH * TIMER_COUNT_DIVIDER + THRESHOLD)
         && chan < RC_CHANNELS_COUNT)
     {
-      rcValue[chan] = adjust(diff, chan); //store detected value
+      rcValue_v[chan] = adjust(diff, chan); //store detected value
     }
     chan++; //no value detected within expected range, move to next channel
   }
